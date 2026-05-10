@@ -343,22 +343,21 @@ class SelectiveSSM(nn.Module):
         )
         dt = F.softplus(self.dt_proj(dt_raw))                # (B, L, D)
 
-        # ── Discretize A via ZOH: Ā = exp(Δ · A) ─────────────────────────────
+        # ── SSM parameters ────────────────────────────────────────────────────
         A = -torch.exp(self.A_log.float())                   # (D, N)
-        # Expand dims for broadcasting: (B, L, D, N)
-        dt_exp = dt.unsqueeze(-1)                            # (B, L, D, 1)
-        A_exp = A.unsqueeze(0).unsqueeze(0)                  # (1, 1, D, N)
-        dA = torch.exp(dt_exp * A_exp)                       # (B, L, D, N)
 
-        # ── Discretize B: B̄ = Δ · B ──────────────────────────────────────────
-        dB = dt_exp * B_mat.unsqueeze(2)                     # (B, L, D, N)
-
-        # ── Sequential SSM scan ───────────────────────────────────────────────
+        # ── Sequential SSM scan (per-step to avoid (B,L,D,N) allocation) ─────
+        # Pre-allocating dA/dB as (B, L, D, N) would require ~GB of VRAM for
+        # the sequence lengths produced by 96^3 patches.  Instead we slice
+        # dt, B_mat, C_mat one timestep at a time — same math, O(1) overhead.
         h = torch.zeros(B, D, N, device=x.device, dtype=x.dtype)
         ys = []
         for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x[:, t].unsqueeze(-1)
-            y_t = (h * C_mat[:, t].unsqueeze(1)).sum(dim=-1)  # (B, D)
+            dt_t = dt[:, t].unsqueeze(-1)                    # (B, D, 1)
+            dA_t = torch.exp(dt_t * A)                       # (B, D, N)
+            dB_t = dt_t * B_mat[:, t].unsqueeze(1)           # (B, D, N)
+            h = dA_t * h + dB_t * x[:, t].unsqueeze(-1)
+            y_t = (h * C_mat[:, t].unsqueeze(1)).sum(dim=-1) # (B, D)
             ys.append(y_t)
 
         y = torch.stack(ys, dim=1)                           # (B, L, D)
@@ -926,19 +925,28 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    epoch: int = 0,
 ) -> float:
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch:03d}", unit="batch",
+                    dynamic_ncols=True, leave=False)
+    except ImportError:
+        pbar = dataloader
+
     model.train()
     total_loss = 0.0
+    n_batches = 0
 
-    for batch in dataloader:
+    for batch in pbar:
         images = batch["image"].to(device)
         segs = batch["seg"].to(device)
 
         optimizer.zero_grad()
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 logits = model(images)
                 loss = criterion(logits, segs)
             scaler.scale(loss).backward()
@@ -954,8 +962,11 @@ def train_one_epoch(
             optimizer.step()
 
         total_loss += loss.item()
+        n_batches += 1
+        if hasattr(pbar, "set_postfix"):
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    return total_loss / max(len(dataloader), 1)
+    return total_loss / max(n_batches, 1)
 
 
 def train(
@@ -963,7 +974,7 @@ def train(
     num_epochs: int = 100,
     batch_size: int = 1,
     lr: float = 1e-4,
-    patch_size: Tuple[int, int, int] = (128, 128, 128),
+    patch_size: Tuple[int, int, int] = (96, 96, 96),
     num_classes: int = 4,
     base_features: int = 32,
     d_state: int = 16,
@@ -986,6 +997,12 @@ def train(
         device_str    : "auto" | "cuda" | "mps" | "cpu"
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # ── Env cleanup: remove CUDA_LAUNCH_BLOCKING if set by a prior smoke test ─
+    # It forces synchronous kernel execution and prevents DataParallel from
+    # overlapping work across multiple GPUs.
+    os.environ.pop("CUDA_LAUNCH_BLOCKING", None)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # ── Device selection ──────────────────────────────────────────────────────
     if device_str == "auto":
@@ -1011,20 +1028,34 @@ def train(
     val_loader = DataLoader(val_set, batch_size=batch_size,
                             shuffle=False, num_workers=4, pin_memory=True)
 
-    # ── Model, Loss, Optimiser ────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────────
     model = MambaBTS(in_channels=4, num_classes=num_classes,
                      base_features=base_features, d_state=d_state).to(device)
+
+    # ── Multi-GPU: DataParallel ───────────────────────────────────────────────
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    if n_gpus > 1:
+        device_ids = list(range(n_gpus))
+        print(f"[Train] DataParallel across GPUs {device_ids}")
+        model = nn.DataParallel(model, device_ids=device_ids)
+        for i in device_ids:
+            free, total = torch.cuda.mem_get_info(i)
+            print(f"  GPU {i}: {free // 1024**2} MB free / {total // 1024**2} MB total")
+    else:
+        print("[Train] Single GPU / CPU — no DataParallel")
+
+    # ── Loss, Optimiser, Scheduler, AMP scaler ────────────────────────────────
     criterion = CombinedLoss(num_classes=num_classes)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs, eta_min=1e-6
     )
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     best_dsc = 0.0
     for epoch in range(1, num_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer,
-                                     criterion, device, scaler)
+                                     criterion, device, scaler, epoch=epoch)
         scheduler.step()
 
         if epoch % 10 == 0 or epoch == num_epochs:
@@ -1036,9 +1067,13 @@ def train(
             if mean_dsc > best_dsc:
                 best_dsc = mean_dsc
                 ckpt_path = os.path.join(checkpoint_dir, "best_model.pth")
+                # Unwrap DataParallel before saving so inference can load plain MambaBTS
+                state = (model.module.state_dict()
+                         if isinstance(model, nn.DataParallel)
+                         else model.state_dict())
                 torch.save({
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": state,
                     "optimizer_state": optimizer.state_dict(),
                     "best_dsc": best_dsc,
                 }, ckpt_path)
